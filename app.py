@@ -3,8 +3,14 @@ import streamlit as st
 import pandas as pd
 import os
 import hashlib
+import threading
+import time
+
 from datetime import datetime
 from PIL import Image
+from functools import partial
+
+from streamlit_webrtc import webrtc_streamer, WebRtcMode
 
 from config import (
     MODEL_PATH,
@@ -13,6 +19,7 @@ from config import (
     CLASS_NAMES,
     HISTORY_PATH
 )
+
 
 # --------------------------------------------------
 # PAGE CONFIGURATION
@@ -24,6 +31,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
 
 # --------------------------------------------------
 # CUSTOM DARK THEME
@@ -139,9 +147,12 @@ hr {
 # --------------------------------------------------
 
 def load_history():
+
     if os.path.exists(HISTORY_PATH):
+
         try:
             return pd.read_csv(HISTORY_PATH)
+
         except pd.errors.EmptyDataError:
             return pd.DataFrame()
 
@@ -149,7 +160,11 @@ def load_history():
 
 
 def save_history(defect, confidence, filename):
-    os.makedirs(os.path.dirname(HISTORY_PATH), exist_ok=True)
+
+    history_dir = os.path.dirname(HISTORY_PATH)
+
+    if history_dir:
+        os.makedirs(history_dir, exist_ok=True)
 
     record = pd.DataFrame([{
         "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -160,12 +175,15 @@ def save_history(defect, confidence, filename):
     }])
 
     if os.path.exists(HISTORY_PATH):
+
         try:
             old_history = pd.read_csv(HISTORY_PATH)
+
             record = pd.concat(
                 [old_history, record],
                 ignore_index=True
             )
+
         except pd.errors.EmptyDataError:
             pass
 
@@ -174,9 +192,84 @@ def save_history(defect, confidence, filename):
 
 @st.cache_resource
 def get_model():
-    # Import TensorFlow only when prediction is requested.
+
     from prediction import load_model
+
     return load_model()
+
+
+# --------------------------------------------------
+# LIVE CAMERA VIDEO PROCESSOR
+# --------------------------------------------------
+
+class VideoProcessor:
+
+    def __init__(self, model):
+
+        self.model = model
+
+        self.lock = threading.Lock()
+
+        self.latest_result = None
+        self.latest_error = None
+
+        self.last_prediction_time = 0
+
+        # Run prediction approximately once per second.
+        self.prediction_interval = 1.0
+
+    def recv(self, frame):
+
+        current_time = time.monotonic()
+
+        if (
+            current_time - self.last_prediction_time
+            >= self.prediction_interval
+        ):
+
+            self.last_prediction_time = current_time
+
+            try:
+
+                from prediction import predict_fabric_defect
+
+                image_array = frame.to_ndarray(
+                    format="rgb24"
+                )
+
+                image = Image.fromarray(image_array)
+
+                defect, confidence, probabilities = (
+                    predict_fabric_defect(
+                        image,
+                        self.model
+                    )
+                )
+
+                with self.lock:
+
+                    self.latest_result = {
+                        "defect": defect,
+                        "confidence": confidence,
+                        "probabilities": [
+                            float(value)
+                            for value in probabilities
+                        ]
+                    }
+
+                    self.latest_error = None
+
+            except Exception as e:
+
+                with self.lock:
+                    self.latest_error = str(e)
+
+        return frame
+
+    def get_latest_result(self):
+
+        with self.lock:
+            return self.latest_result, self.latest_error
 
 
 # --------------------------------------------------
@@ -219,8 +312,10 @@ with st.sidebar:
     st.divider()
 
     st.markdown("### System Status")
+
     st.caption("VGG16 Transfer Learning")
     st.caption("9 Fabric Categories")
+    st.caption("Live Webcam Detection")
 
 
 # --------------------------------------------------
@@ -242,11 +337,13 @@ if page == "Dashboard":
     st.write("")
 
     history = load_history()
+
     total_inspections = len(history)
 
     col1, col2, col3 = st.columns(3)
 
     with col1:
+
         st.markdown(f"""
         <div class="metric-card">
             <div class="metric-value">{MODEL_ACCURACY}%</div>
@@ -255,6 +352,7 @@ if page == "Dashboard":
         """, unsafe_allow_html=True)
 
     with col2:
+
         st.markdown(f"""
         <div class="metric-card">
             <div class="metric-value">{len(CLASS_NAMES)}</div>
@@ -263,6 +361,7 @@ if page == "Dashboard":
         """, unsafe_allow_html=True)
 
     with col3:
+
         st.markdown(f"""
         <div class="metric-card">
             <div class="metric-value">{total_inspections}</div>
@@ -271,6 +370,7 @@ if page == "Dashboard":
         """, unsafe_allow_html=True)
 
     st.write("")
+
     st.divider()
 
     st.subheader("Welcome to FabricIQ")
@@ -278,18 +378,22 @@ if page == "Dashboard":
     st.markdown("""
     FabricIQ is an intelligent fabric inspection system that uses
     deep learning and VGG16 transfer learning to identify fabric
-    defects from uploaded images.
+    defects from uploaded images and live webcam video.
 
     **Key capabilities:**
 
     - Automated fabric defect classification
+    - Live webcam fabric inspection
     - Identification of nine fabric categories
     - Prediction confidence analysis
     - Inspection history tracking
     - Model performance information
     """)
 
-    st.info("Navigate to Defect Inspection to analyze a fabric image.")
+    st.info(
+        "Navigate to Defect Inspection to upload an image "
+        "or start live camera inspection."
+    )
 
 
 # --------------------------------------------------
@@ -304,142 +408,366 @@ elif page == "Defect Inspection":
     )
 
     st.markdown(
-        "<div class='subtitle'>Upload a fabric image to identify possible defects.</div>",
+        "<div class='subtitle'>Inspect fabric using an uploaded image or live webcam.</div>",
         unsafe_allow_html=True
     )
 
     st.write("")
 
-    uploaded_file = st.file_uploader(
-        "Upload Fabric Image",
-        type=["jpg", "jpeg", "png"]
+    inspection_mode = st.radio(
+        "Select Inspection Mode",
+        ["Image Upload", "Live Camera"],
+        horizontal=True
     )
 
-    if uploaded_file is not None:
+    st.divider()
 
-        image = Image.open(uploaded_file).convert("RGB")
+    # --------------------------------------------------
+    # IMAGE UPLOAD INSPECTION
+    # --------------------------------------------------
 
-        current_hash = hashlib.sha256(
-            uploaded_file.getvalue()
-        ).hexdigest()
+    if inspection_mode == "Image Upload":
 
-        if current_hash != st.session_state.image_hash:
-            st.session_state.image_hash = current_hash
-            st.session_state.inspection_result = None
+        uploaded_file = st.file_uploader(
+            "Upload Fabric Image",
+            type=["jpg", "jpeg", "png"]
+        )
 
-        col1, col2 = st.columns([1, 1])
+        if uploaded_file is not None:
 
-        with col1:
-            st.subheader("Uploaded Image")
-            st.image(
-                image,
-                caption=uploaded_file.name,
-                use_container_width=True
-            )
+            image = Image.open(
+                uploaded_file
+            ).convert("RGB")
 
-        with col2:
-            st.subheader("Inspection")
+            current_hash = hashlib.sha256(
+                uploaded_file.getvalue()
+            ).hexdigest()
 
-            st.markdown("""
-            <div class="section-card">
-                <p>Image uploaded successfully.</p>
-                <p>Click the button below to start defect classification.</p>
-            </div>
-            """, unsafe_allow_html=True)
+            if current_hash != st.session_state.image_hash:
 
-            analyze = st.button(
-                "🔍 Analyze Fabric",
-                use_container_width=True
-            )
+                st.session_state.image_hash = current_hash
 
-            if analyze:
+                st.session_state.inspection_result = None
 
-                try:
-                    with st.spinner("Analyzing fabric image..."):
-
-                        model = get_model()
-
-                        from prediction import predict_fabric_defect
-
-                        defect, confidence, probabilities = (
-                            predict_fabric_defect(image, model)
-                        )
-
-                        st.session_state.inspection_result = {
-                            "defect": defect,
-                            "confidence": confidence,
-                            "probabilities": probabilities
-                        }
-
-                        save_history(
-                            defect,
-                            confidence,
-                            uploaded_file.name
-                        )
-
-                except Exception as e:
-                    st.error("Unable to perform prediction.")
-                    st.exception(e)
-
-        result = st.session_state.inspection_result
-
-        if result is not None:
-
-            st.divider()
-            st.subheader("Inspection Result")
-
-            defect = result["defect"]
-            confidence = result["confidence"]
-            probabilities = result["probabilities"]
-
-            col1, col2 = st.columns(2)
+            col1, col2 = st.columns([1, 1])
 
             with col1:
-                st.markdown("**Predicted Category**")
 
-                if defect.lower() == "defect free":
-                    st.success(f"✅ {defect}")
-                else:
-                    st.error(f"⚠️ {defect}")
+                st.subheader("Uploaded Image")
 
-            with col2:
-                st.markdown("**Prediction Confidence**")
-                st.metric(
-                    "Confidence",
-                    f"{confidence:.2f}%"
+                st.image(
+                    image,
+                    caption=uploaded_file.name,
+                    use_container_width=True
                 )
 
-            st.progress(
-                max(0.0, min(1.0, confidence / 100))
+            with col2:
+
+                st.subheader("Inspection")
+
+                st.markdown("""
+                <div class="section-card">
+                    <p>Image uploaded successfully.</p>
+                    <p>Click the button below to start defect classification.</p>
+                </div>
+                """, unsafe_allow_html=True)
+
+                analyze = st.button(
+                    "🔍 Analyze Fabric",
+                    use_container_width=True
+                )
+
+                if analyze:
+
+                    try:
+
+                        with st.spinner(
+                            "Analyzing fabric image..."
+                        ):
+
+                            model = get_model()
+
+                            from prediction import predict_fabric_defect
+
+                            defect, confidence, probabilities = (
+                                predict_fabric_defect(
+                                    image,
+                                    model
+                                )
+                            )
+
+                            st.session_state.inspection_result = {
+                                "defect": defect,
+                                "confidence": confidence,
+                                "probabilities": probabilities
+                            }
+
+                            save_history(
+                                defect,
+                                confidence,
+                                uploaded_file.name
+                            )
+
+                    except Exception as e:
+
+                        st.error(
+                            "Unable to perform prediction."
+                        )
+
+                        st.exception(e)
+
+            result = st.session_state.inspection_result
+
+            if result is not None:
+
+                st.divider()
+
+                st.subheader("Inspection Result")
+
+                defect = result["defect"]
+
+                confidence = result["confidence"]
+
+                probabilities = result["probabilities"]
+
+                col1, col2 = st.columns(2)
+
+                with col1:
+
+                    st.markdown("**Predicted Category**")
+
+                    if defect.lower() == "defect free":
+
+                        st.success(f"✅ {defect}")
+
+                    else:
+
+                        st.error(f"⚠️ {defect}")
+
+                with col2:
+
+                    st.markdown("**Prediction Confidence**")
+
+                    st.metric(
+                        "Confidence",
+                        f"{confidence:.2f}%"
+                    )
+
+                st.progress(
+                    max(
+                        0.0,
+                        min(1.0, confidence / 100)
+                    )
+                )
+
+                st.divider()
+
+                st.subheader("Class Probability Analysis")
+
+                probability_df = pd.DataFrame({
+                    "Fabric Category": CLASS_NAMES,
+                    "Probability (%)": [
+                        round(float(value) * 100, 2)
+                        for value in probabilities
+                    ]
+                }).sort_values(
+                    "Probability (%)",
+                    ascending=False
+                )
+
+                st.bar_chart(
+                    probability_df.set_index(
+                        "Fabric Category"
+                    )
+                )
+
+                st.dataframe(
+                    probability_df,
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+        else:
+
+            st.info(
+                "Please upload a fabric image to begin inspection."
             )
 
-            st.divider()
+    # --------------------------------------------------
+    # LIVE CAMERA INSPECTION
+    # --------------------------------------------------
 
-            st.subheader("Class Probability Analysis")
+    elif inspection_mode == "Live Camera":
 
-            probability_df = pd.DataFrame({
-                "Fabric Category": CLASS_NAMES,
-                "Probability (%)": [
-                    round(float(value) * 100, 2)
-                    for value in probabilities
-                ]
-            }).sort_values(
-                "Probability (%)",
-                ascending=False
+        st.subheader("Live Fabric Inspection")
+
+        st.markdown("""
+        Position the fabric in front of your webcam.
+
+        FabricIQ will continuously analyze the video and display
+        the predicted fabric category and confidence.
+        """)
+
+        st.info(
+            "Allow camera access when your browser requests permission. "
+            "Predictions are performed approximately once per second."
+        )
+
+        try:
+
+            with st.spinner("Loading VGG16 model..."):
+
+                model = get_model()
+
+            ctx = webrtc_streamer(
+                key="fabric-live-inspection",
+                mode=WebRtcMode.SENDRECV,
+                video_processor_factory=partial(
+                    VideoProcessor,
+                    model=model
+                ),
+                rtc_configuration={
+                    "iceServers": [
+                        {
+                            "urls": [
+                                "stun:stun.l.google.com:19302"
+                            ]
+                        }
+                    ]
+                },
+                media_stream_constraints={
+                    "video": True,
+                    "audio": False
+                },
+                async_processing=True
             )
 
-            st.bar_chart(
-                probability_df.set_index("Fabric Category")
+            st.write("")
+
+            # --------------------------------------------------
+            # LIVE PREDICTION DISPLAY
+            # --------------------------------------------------
+
+            @st.fragment(run_every="1s")
+            def display_live_result():
+
+                if ctx.video_processor is None:
+
+                    st.info(
+                        "Start the camera to begin fabric inspection."
+                    )
+
+                    return
+
+                result, error = (
+                    ctx.video_processor.get_latest_result()
+                )
+
+                if error:
+
+                    st.error(
+                        f"Prediction error: {error}"
+                    )
+
+                    return
+
+                if result is None:
+
+                    st.info(
+                        "Waiting for the first fabric prediction..."
+                    )
+
+                    return
+
+                defect = result["defect"]
+
+                confidence = result["confidence"]
+
+                probabilities = result["probabilities"]
+
+                st.divider()
+
+                st.subheader("Live Inspection Result")
+
+                col1, col2 = st.columns(2)
+
+                with col1:
+
+                    st.markdown("**Predicted Category**")
+
+                    if defect.lower() == "defect free":
+
+                        st.success(f"✅ {defect}")
+
+                    else:
+
+                        st.error(f"⚠️ {defect}")
+
+                with col2:
+
+                    st.markdown("**Prediction Confidence**")
+
+                    st.metric(
+                        "Confidence",
+                        f"{confidence:.2f}%"
+                    )
+
+                st.progress(
+                    max(
+                        0.0,
+                        min(1.0, confidence / 100)
+                    )
+                )
+
+                probability_df = pd.DataFrame({
+                    "Fabric Category": CLASS_NAMES,
+                    "Probability (%)": [
+                        round(float(value) * 100, 2)
+                        for value in probabilities
+                    ]
+                }).sort_values(
+                    "Probability (%)",
+                    ascending=False
+                )
+
+                st.subheader("Class Probability Analysis")
+
+                st.bar_chart(
+                    probability_df.set_index(
+                        "Fabric Category"
+                    )
+                )
+
+                st.dataframe(
+                    probability_df,
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+                if st.button(
+                    "💾 Save Current Inspection",
+                    key="save_live_inspection"
+                ):
+
+                    save_history(
+                        defect,
+                        confidence,
+                        "Live Webcam"
+                    )
+
+                    st.success(
+                        "Live inspection saved successfully!"
+                    )
+
+            display_live_result()
+
+        except Exception as e:
+
+            st.error(
+                "Unable to start live camera inspection."
             )
 
-            st.dataframe(
-                probability_df,
-                use_container_width=True,
-                hide_index=True
-            )
-
-    else:
-        st.info("Please upload a fabric image to begin inspection.")
+            st.exception(e)
 
 
 # --------------------------------------------------
@@ -467,15 +795,25 @@ elif page == "Inspection History":
         col1, col2 = st.columns(2)
 
         with col1:
-            st.metric("Total Inspections", len(history))
+
+            st.metric(
+                "Total Inspections",
+                len(history)
+            )
 
         with col2:
+
             if "Predicted Class" in history.columns:
+
                 defect_count = (
                     history["Predicted Class"].str.lower()
                     != "defect free"
                 ).sum()
-                st.metric("Defects Detected", int(defect_count))
+
+                st.metric(
+                    "Defects Detected",
+                    int(defect_count)
+                )
 
         st.divider()
 
@@ -487,18 +825,28 @@ elif page == "Inspection History":
 
         st.download_button(
             "⬇️ Download Inspection History",
-            data=history.to_csv(index=False).encode("utf-8"),
+            data=history.to_csv(
+                index=False
+            ).encode("utf-8"),
             file_name="fabric_inspection_history.csv",
             mime="text/csv"
         )
 
         if st.button("🗑️ Clear Inspection History"):
+
             os.remove(HISTORY_PATH)
-            st.success("Inspection history cleared.")
+
+            st.success(
+                "Inspection history cleared."
+            )
+
             st.rerun()
 
     else:
-        st.info("No inspection records available yet.")
+
+        st.info(
+            "No inspection records available yet."
+        )
 
 
 # --------------------------------------------------
@@ -524,24 +872,30 @@ elif page == "Model Information":
     col1, col2 = st.columns(2)
 
     with col1:
+
         st.markdown("""
         <div class="section-card">
             <h3 style="color:#60A5FA;">Architecture</h3>
             <p>VGG16 Transfer Learning</p>
+
             <h3 style="color:#60A5FA;">Input Image Size</h3>
             <p>224 × 224 RGB</p>
+
             <h3 style="color:#60A5FA;">Framework</h3>
             <p>TensorFlow / Keras</p>
         </div>
         """, unsafe_allow_html=True)
 
     with col2:
+
         st.markdown(f"""
         <div class="section-card">
             <h3 style="color:#60A5FA;">Test Accuracy</h3>
             <p>{MODEL_ACCURACY}%</p>
+
             <h3 style="color:#60A5FA;">Model Type</h3>
             <p>Image Classification</p>
+
             <h3 style="color:#60A5FA;">Model Name</h3>
             <p>{MODEL_NAME}</p>
         </div>
@@ -552,14 +906,22 @@ elif page == "Model Information":
     st.subheader("Supported Fabric Categories")
 
     for i, category in enumerate(CLASS_NAMES, start=1):
+
         st.write(f"{i}. {category}")
 
     st.divider()
 
     if os.path.exists(MODEL_PATH):
-        st.success("Trained model file found.")
+
+        st.success(
+            "Trained model file found."
+        )
+
     else:
-        st.error("Trained model file not found. Check the models folder.")
+
+        st.error(
+            "Trained model file not found. Check the models folder."
+        )
 
 
 # --------------------------------------------------
