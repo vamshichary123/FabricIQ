@@ -1,10 +1,12 @@
 
 import streamlit as st
 import pandas as pd
+import numpy as np
 import os
 import hashlib
 import threading
 import time
+import av
 
 from datetime import datetime
 from PIL import Image
@@ -212,10 +214,11 @@ class VideoProcessor:
 
         self.latest_result = None
         self.latest_error = None
+        self.latest_annotated_frame = None
 
         self.last_prediction_time = 0
 
-        # Run prediction approximately once per second.
+        # Run Grad-CAM prediction approximately once per second.
         self.prediction_interval = 1.0
 
     def recv(self, frame):
@@ -231,7 +234,7 @@ class VideoProcessor:
 
             try:
 
-                from prediction import predict_fabric_defect
+                from prediction import predict_with_gradcam
 
                 image_array = frame.to_ndarray(
                     format="rgb24"
@@ -239,11 +242,19 @@ class VideoProcessor:
 
                 image = Image.fromarray(image_array)
 
-                defect, confidence, probabilities = (
-                    predict_fabric_defect(
-                        image,
-                        self.model
-                    )
+                (
+                    defect,
+                    confidence,
+                    probabilities,
+                    annotated_image,
+                    heatmap_image
+                ) = predict_with_gradcam(
+                    image,
+                    self.model
+                )
+
+                annotated_array = np.array(
+                    annotated_image.convert("RGB")
                 )
 
                 with self.lock:
@@ -257,6 +268,8 @@ class VideoProcessor:
                         ]
                     }
 
+                    self.latest_annotated_frame = annotated_array
+
                     self.latest_error = None
 
             except Exception as e:
@@ -264,12 +277,28 @@ class VideoProcessor:
                 with self.lock:
                     self.latest_error = str(e)
 
+        # Display the most recent Grad-CAM annotated frame.
+        with self.lock:
+
+            display_frame = self.latest_annotated_frame
+
+        if display_frame is not None:
+
+            return av.VideoFrame.from_ndarray(
+                display_frame,
+                format="rgb24"
+            )
+
         return frame
 
     def get_latest_result(self):
 
         with self.lock:
-            return self.latest_result, self.latest_error
+
+            return (
+                self.latest_result,
+                self.latest_error
+            )
 
 
 # --------------------------------------------------
@@ -316,6 +345,7 @@ with st.sidebar:
     st.caption("VGG16 Transfer Learning")
     st.caption("9 Fabric Categories")
     st.caption("Live Webcam Detection")
+    st.caption("Grad-CAM Defect Visualization")
 
 
 # --------------------------------------------------
@@ -386,6 +416,8 @@ if page == "Dashboard":
     - Live webcam fabric inspection
     - Identification of nine fabric categories
     - Prediction confidence analysis
+    - Grad-CAM heatmap visualization
+    - Approximate defect region highlighting
     - Inspection history tracking
     - Model performance information
     """)
@@ -468,7 +500,7 @@ elif page == "Defect Inspection":
                 st.markdown("""
                 <div class="section-card">
                     <p>Image uploaded successfully.</p>
-                    <p>Click the button below to start defect classification.</p>
+                    <p>Click the button below to start defect classification and Grad-CAM visualization.</p>
                 </div>
                 """, unsafe_allow_html=True)
 
@@ -482,24 +514,37 @@ elif page == "Defect Inspection":
                     try:
 
                         with st.spinner(
-                            "Analyzing fabric image..."
+                            "Analyzing fabric and generating Grad-CAM visualization..."
                         ):
 
                             model = get_model()
 
-                            from prediction import predict_fabric_defect
+                            from prediction import predict_with_gradcam
 
-                            defect, confidence, probabilities = (
-                                predict_fabric_defect(
-                                    image,
-                                    model
-                                )
+                            (
+                                defect,
+                                confidence,
+                                probabilities,
+                                annotated_image,
+                                heatmap_image
+                            ) = predict_with_gradcam(
+                                image,
+                                model
                             )
 
                             st.session_state.inspection_result = {
                                 "defect": defect,
                                 "confidence": confidence,
-                                "probabilities": probabilities
+                                "probabilities": [
+                                    float(value)
+                                    for value in probabilities
+                                ],
+                                "annotated_image": np.array(
+                                    annotated_image
+                                ),
+                                "heatmap_image": np.array(
+                                    heatmap_image
+                                )
                             }
 
                             save_history(
@@ -562,6 +607,58 @@ elif page == "Defect Inspection":
 
                 st.divider()
 
+                # ------------------------------------------
+                # GRAD-CAM VISUALIZATION
+                # ------------------------------------------
+
+                st.subheader("Defect Region Visualization")
+
+                st.markdown("""
+                The Grad-CAM visualization highlights image regions
+                that contributed to the model's prediction.
+                """)
+
+                col1, col2 = st.columns(2)
+
+                with col1:
+
+                    st.markdown("**Grad-CAM Heatmap**")
+
+                    st.image(
+                        result["heatmap_image"],
+                        use_container_width=True
+                    )
+
+                with col2:
+
+                    st.markdown("**Highlighted Defect Region**")
+
+                    st.image(
+                        result["annotated_image"],
+                        use_container_width=True
+                    )
+
+                if defect.lower() == "defect free":
+
+                    st.success(
+                        "The model classified this fabric as defect free. "
+                        "No defect bounding rectangle was drawn."
+                    )
+
+                else:
+
+                    st.info(
+                        "The red rectangle indicates an approximate "
+                        "region highlighted by Grad-CAM. It is not "
+                        "a ground-truth object detection boundary."
+                    )
+
+                st.divider()
+
+                # ------------------------------------------
+                # CLASS PROBABILITY ANALYSIS
+                # ------------------------------------------
+
                 st.subheader("Class Probability Analysis")
 
                 probability_df = pd.DataFrame({
@@ -605,12 +702,14 @@ elif page == "Defect Inspection":
         Position the fabric in front of your webcam.
 
         FabricIQ will continuously analyze the video and display
-        the predicted fabric category and confidence.
+        the predicted fabric category, confidence, and Grad-CAM
+        highlighted region.
         """)
 
         st.info(
             "Allow camera access when your browser requests permission. "
-            "Predictions are performed approximately once per second."
+            "Predictions and Grad-CAM visualizations are performed "
+            "approximately once per second."
         )
 
         try:
@@ -719,6 +818,8 @@ elif page == "Defect Inspection":
                     )
                 )
 
+                st.subheader("Class Probability Analysis")
+
                 probability_df = pd.DataFrame({
                     "Fabric Category": CLASS_NAMES,
                     "Probability (%)": [
@@ -729,8 +830,6 @@ elif page == "Defect Inspection":
                     "Probability (%)",
                     ascending=False
                 )
-
-                st.subheader("Class Probability Analysis")
 
                 st.bar_chart(
                     probability_df.set_index(
@@ -894,7 +993,7 @@ elif page == "Model Information":
             <p>{MODEL_ACCURACY}%</p>
 
             <h3 style="color:#60A5FA;">Model Type</h3>
-            <p>Image Classification</p>
+            <p>Image Classification with Grad-CAM Visualization</p>
 
             <h3 style="color:#60A5FA;">Model Name</h3>
             <p>{MODEL_NAME}</p>
@@ -935,7 +1034,7 @@ st.markdown(
     <div style="text-align:center; color:#94A3B8; padding:10px;">
         FabricIQ | Intelligent Fabric Inspection
         <br>
-        Powered by VGG16 Deep Learning
+        Powered by VGG16 Deep Learning and Grad-CAM
     </div>
     """,
     unsafe_allow_html=True
